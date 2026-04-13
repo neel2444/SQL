@@ -1,0 +1,854 @@
+
+---
+title: "Liquor Sales Data Analysis"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+library(dplyr)
+
+df_raw <- read.csv(
+  "/Workspace/Users/shahneel364@gmail.com/Drafts/Intro to Databricks - liquor sales 2000 rows.csv",
+  stringsAsFactors = FALSE,
+  na.strings       = c("", "NA"),
+  fileEncoding     = "UTF-8"
+)
+
+cat("Rows loaded:", nrow(df_raw), " | Columns:", ncol(df_raw), "\n")
+glimpse(df_raw)
+```
+
+
+```{r}
+library(lubridate)
+
+df <- df_raw %>%
+  # 1. Keep only real data rows (dataset has 2 000 real + padding NAs)
+  filter(!is.na(date)) %>%
+
+  # 2. Parse dates
+  mutate(
+    date       = dmy_hm(date),          # "19-02-2014 00:00"
+    year       = year(date),
+    month      = month(date, label = TRUE, abbr = TRUE),
+    month_num  = month(date),
+    quarter    = paste0("Q", quarter(date)),
+    day_of_wk  = wday(date, label = TRUE, abbr = TRUE)
+  ) %>%
+
+  # 3. Fix numeric columns
+  mutate(
+    state_btl_cost = as.numeric(state_btl_cost),
+    btl_price      = as.numeric(btl_price),
+    bottle_qty     = as.numeric(bottle_qty),
+    total          = as.numeric(total),
+    pack           = as.numeric(pack),
+    liter_size     = as.numeric(liter_size)
+  )
+```
+
+
+```{r}
+# 4. Derived business metrics
+df <- df %>%
+  mutate(
+    margin_per_btl  = btl_price - state_btl_cost,
+    margin_pct      = round((margin_per_btl / btl_price) * 100, 2),
+    revenue_per_ltr = total / (bottle_qty * liter_size / 1000 + 1e-9),
+    is_premium      = ifelse(btl_price >= 25, "Premium", "Standard"),
+    size_category   = case_when(
+      liter_size <= 375  ~ "Mini (\u2264375 ml)",
+      liter_size <= 750  ~ "Standard (376\u2013750 ml)",
+      liter_size <= 1000 ~ "Litre (751\u20131 000 ml)",
+      TRUE               ~ "Large (>1 000 ml)"
+    ),
+    # Simplify category names to broad spirit types
+    spirit_type = case_when(
+      grepl("VODKA",    category_name, ignore.case = TRUE) ~ "Vodka",
+      grepl("WHISKEY|WHISKY|BOURBON|SCOTCH|IRISH|CANADIAN|TENNESSEE",
+            category_name, ignore.case = TRUE)             ~ "Whiskey",
+      grepl("RUM",      category_name, ignore.case = TRUE) ~ "Rum",
+      grepl("TEQUILA|MEZCAL", category_name, ignore.case = TRUE) ~ "Tequila",
+      grepl("GIN",      category_name, ignore.case = TRUE) ~ "Gin",
+      grepl("BRANDIES|BRANDY|COGNAC",
+            category_name, ignore.case = TRUE)             ~ "Brandy/Cognac",
+      grepl("COCKTAIL|CORDIAL|LIQUEUR|CREAM|SCHNAPPS|AMARETTO",
+            category_name, ignore.case = TRUE)             ~ "Liqueurs & Cordials",
+      TRUE                                                  ~ "Other"
+    )
+  )
+```
+
+
+```{r}
+# 5. Remove obvious outliers (price & qty)
+df <- df %>%
+  filter(
+    btl_price      > 0,
+    bottle_qty     > 0,
+    total          > 0,
+    margin_pct     >= 0,
+    margin_pct     <= 80
+  )
+```
+
+
+```{r}
+# 6. Factorise
+df <- df %>%
+  mutate(
+    county       = as.factor(county),
+    spirit_type  = as.factor(spirit_type),
+    is_premium   = as.factor(is_premium),
+    size_category = factor(size_category,
+                           levels = c("Mini (\u2264375 ml)", "Standard (376\u2013750 ml)",
+                                      "Litre (751\u20131 000 ml)", "Large (>1 000 ml)"))
+  )
+
+cat("\u2705 Clean dataset \u2014 Rows:", nrow(df), "| Columns:", ncol(df), "\n")
+summary(df[, c("total", "btl_price", "bottle_qty", "margin_pct")])
+```
+
+
+```{r}
+library(tidyr)
+
+missing_report <- df_raw %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Column", values_to = "Missing_Count") %>%
+  mutate(Missing_Pct = round(Missing_Count / nrow(df_raw) * 100, 1)) %>%
+  arrange(desc(Missing_Pct))
+
+knitr::kable(missing_report, caption = "\U0001f4ca Missing Value Report \u2014 Raw Dataset")
+```
+
+
+```{r}
+cat("
+
+")
+
+cat(sprintf("📦 Total Transactions Analysed : %s\n",   format(nrow(df), big.mark = ",")))
+cat(sprintf("💰 Total Revenue               : $%s\n",  format(round(sum(df$total)), big.mark = ",")))
+cat(sprintf("📅 Date Range                  : %s → %s\n",
+            format(min(df$date, na.rm = TRUE), "%d %b %Y"),
+            format(max(df$date, na.rm = TRUE), "%d %b %Y")))
+cat(sprintf("🍾 Unique Spirit Categories    : %s\n",   n_distinct(df$category_name)))
+cat(sprintf("🏪 Unique Stores               : %s\n",   n_distinct(df$store)))
+cat(sprintf("🗺️  Unique Counties             : %s\n",  n_distinct(df$county)))
+cat(sprintf("🏭 Unique Vendors               : %s\n",  n_distinct(df$vendor)))
+cat(sprintf("📈 Avg Sale Value              : $%.2f\n", mean(df$total)))
+cat(sprintf("📈 Avg Bottle Price            : $%.2f\n", mean(df$btl_price)))
+cat(sprintf("📈 Avg Gross Margin            : %.1f%%\n", mean(df$margin_pct)))
+cat(sprintf("🥇 Top Spirit Category         : %s\n",
+            names(sort(table(df$spirit_type), decreasing = TRUE)[1])))
+cat(sprintf("🗺️  Top County by Revenue       : %s\n",
+            df %>% group_by(county) %>% summarise(rev = sum(total)) %>%
+              arrange(desc(rev)) %>% slice(1) %>% pull(county)))
+
+
+```
+
+
+```{r}
+library(ggplot2)
+
+# Define a clean theme
+theme_danmurphy <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 16, colour = "#1a1a2e"),
+    plot.subtitle    = element_text(size = 11, colour = "#555555"),
+    plot.caption     = element_text(size = 9,  colour = "#888888"),
+    axis.title       = element_text(face = "bold"),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+```{r}
+library(scales)
+
+p_hist <- ggplot(df, aes(x = total)) +
+  geom_histogram(
+    aes(fill = ..count..),
+    bins    = 50,
+    colour  = "white",
+    linewidth = 0.2
+  ) +
+  scale_fill_gradient(low = "#a8d8ea", high = "#0d3b66", guide = "none") +
+  scale_x_continuous(labels = dollar_format(), limits = c(0, quantile(df$total, 0.99))) +
+  labs(
+    title    = "Distribution of Transaction Values",
+    subtitle = "Most transactions cluster below $200 \u2014 a few high-value orders skew the mean",
+    x        = "Total Sale Value (USD)",
+    y        = "Number of Transactions",
+    caption  = "Source: Dan Murphy's Liquor Sales Dataset"
+  ) +
+  theme_danmurphy
+
+print(p_hist)
+```
+
+
+```{r}
+p_log <- ggplot(df, aes(x = log1p(total))) +
+  geom_density(fill = "#0d3b66", alpha = 0.7, colour = "#0d3b66") +
+  geom_vline(xintercept = log1p(mean(df$total)), linetype = "dashed",
+             colour = "#e63946", linewidth = 1) +
+  annotate("text", x = log1p(mean(df$total)) + 0.15, y = 0.35,
+           label = paste0("Mean = $", round(mean(df$total), 0)),
+           colour = "#e63946", fontface = "bold") +
+  labs(
+    title    = "Log-Transformed Sale Value Density",
+    subtitle = "Right-skewed distribution confirms bulk/premium purchases drive tail revenue",
+    x        = "log(Total Sale Value + 1)",
+    y        = "Density"
+  ) +
+  theme_danmurphy
+
+print(p_log)
+
+```
+
+
+```{r}
+library(e1071)
+
+cat(sprintf("\n\U0001f4d0 Skewness of Total Sales : %.2f (positive = right-skewed)\n",
+            skewness(df$total)))
+cat(sprintf("\U0001f4d0 Kurtosis of Total Sales : %.2f (>3 = heavy tails)\n",
+            kurtosis(df$total)))
+```
+
+
+```{r}
+spirit_summary <- df %>%
+  group_by(spirit_type) %>%
+  summarise(
+    total_revenue   = sum(total),
+    transactions    = n(),
+    avg_sale        = mean(total),
+    avg_margin_pct  = mean(margin_pct),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_revenue))
+
+knitr::kable(spirit_summary %>%
+               mutate(total_revenue = dollar(total_revenue),
+                      avg_sale      = dollar(round(avg_sale, 2)),
+                      avg_margin_pct = paste0(round(avg_margin_pct, 1), "%")),
+             caption = "💼 Revenue Summary by Spirit Type")
+
+p_spirit_rev <- ggplot(spirit_summary,
+                       aes(x = reorder(spirit_type, total_revenue),
+                           y = total_revenue, fill = spirit_type)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  geom_text(aes(label = dollar(round(total_revenue / 1000), suffix = "K")),
+            hjust = -0.1, fontface = "bold", size = 3.5) +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K"),
+                     expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_brewer(palette = "Set2") +
+  coord_flip() +
+  labs(
+    title    = "Total Revenue by Spirit Category",
+    subtitle = "Whiskey and Vodka dominate; Tequila and Rum show strong volume",
+    x        = NULL,
+    y        = "Total Revenue (USD)",
+    caption  = "Source: Dan Murphy's Liquor Sales Dataset"
+  ) +
+  theme_danmurphy
+
+print(p_spirit_rev)
+```
+
+
+```{r}
+monthly_trend <- df %>%
+  mutate(year_month = floor_date(date, "month")) %>%
+  group_by(year_month) %>%
+  summarise(
+    revenue      = sum(total),
+    transactions = n(),
+    avg_sale     = mean(total),
+    .groups = "drop"
+  )
+
+p_trend <- ggplot(monthly_trend, aes(x = year_month, y = revenue)) +
+  geom_area(fill = "#a8d8ea", alpha = 0.5) +
+  geom_line(colour = "#0d3b66", linewidth = 1.2) +
+  geom_point(aes(size = transactions), colour = "#e63946", alpha = 0.8) +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  scale_x_datetime(date_labels = "%b %Y", date_breaks = "2 months") +
+  scale_size_continuous(range = c(2, 6), guide = "legend", name = "# Transactions") +
+  labs(
+    title    = "Monthly Revenue Trend",
+    subtitle = "Seasonal peaks visible in Q4 (holiday gifting) and Q1 (summer in Australia)",
+    x        = NULL,
+    y        = "Total Revenue (USD)",
+    caption  = "Bubble size = number of transactions per month"
+  ) +
+  theme_danmurphy +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_trend)
+
+```
+
+
+```{r}
+county_rev <- df %>%
+  group_by(county) %>%
+  summarise(
+    revenue      = sum(total),
+    transactions = n(),
+    avg_margin   = mean(margin_pct),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(revenue)) %>%
+  slice_head(n = 10)
+
+p_county <- ggplot(county_rev,
+                   aes(x = reorder(county, revenue), y = revenue, fill = avg_margin)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = dollar(round(revenue / 1000), suffix = "K")),
+            hjust = -0.1, fontface = "bold", size = 3.3) +
+  scale_fill_gradient(low = "#f9c74f", high = "#d00000",
+                      name = "Avg Margin %") +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K"),
+                     expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(
+    title    = "Top 10 Counties by Total Revenue",
+    subtitle = "Polk County leads by a wide margin — colour shows average gross margin",
+    x        = NULL, y = "Total Revenue (USD)"
+  ) +
+  theme_danmurphy
+
+print(p_county)
+
+
+```
+
+
+```{r}
+library(ggridges)
+
+# Box-plot: margin % by spirit type
+p_margin_box <- ggplot(df, aes(x = reorder(spirit_type, margin_pct, median),
+                               y = margin_pct, fill = spirit_type)) +
+  geom_boxplot(outlier.size = 0.7, outlier.alpha = 0.4, show.legend = FALSE) +
+  geom_hline(yintercept = mean(df$margin_pct), linetype = "dashed",
+             colour = "#e63946", linewidth = 1) +
+  annotate("text", x = 1, y = mean(df$margin_pct) + 1.5,
+           label = paste0("Overall Avg: ", round(mean(df$margin_pct), 1), "%"),
+           colour = "#e63946", size = 3.5) +
+  scale_fill_brewer(palette = "Pastel2") +
+  coord_flip() +
+  labs(
+    title    = "Gross Margin % Distribution by Spirit Type",
+    subtitle = "Liqueurs & Cordials achieve the highest margins; Vodka shows tightest spread",
+    x        = NULL, y = "Gross Margin (%)"
+  ) +
+  theme_danmurphy
+
+print(p_margin_box)
+
+# Ridge plot: distribution shape of margins
+p_ridge <- ggplot(df, aes(x = margin_pct, y = spirit_type, fill = spirit_type)) +
+  geom_density_ridges(alpha = 0.7, scale = 1.2, show.legend = FALSE) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title    = "Margin % Distribution \u2014 Ridge Plot by Spirit Type",
+    subtitle = "Each ridge shows the full spread of margins within that category",
+    x        = "Gross Margin (%)", y = NULL
+  ) +
+  theme_danmurphy
+
+print(p_ridge)
+```
+
+
+```{r}
+premium_summary <- df %>%
+  group_by(is_premium) %>%
+  summarise(
+    n             = n(),
+    total_rev     = sum(total),
+    avg_sale      = mean(total),
+    avg_margin    = mean(margin_pct),
+    avg_qty       = mean(bottle_qty),
+    .groups = "drop"
+  )
+
+knitr::kable(premium_summary %>%
+               mutate(total_rev  = dollar(round(total_rev)),
+                      avg_sale   = dollar(round(avg_sale, 2)),
+                      avg_margin = paste0(round(avg_margin, 1), "%"),
+                      avg_qty    = round(avg_qty, 1)),
+             caption = "🏷️  Premium vs Standard Product Comparison")
+
+p_prem <- ggplot(df, aes(x = is_premium, y = total, fill = is_premium)) +
+  geom_violin(alpha = 0.6, trim = TRUE, show.legend = FALSE) +
+  geom_boxplot(width = 0.15, fill = "white", outlier.shape = NA) +
+  scale_y_log10(labels = dollar_format()) +
+  scale_fill_manual(values = c("Premium" = "#d00000", "Standard" = "#0d3b66")) +
+  labs(
+    title    = "Sale Value Distribution: Premium vs Standard (Log Scale)",
+    subtitle = "Premium products show higher median values but wider spread",
+    x        = NULL, y = "Total Sale Value (USD, log scale)"
+  ) +
+  theme_danmurphy
+
+print(p_prem)
+
+
+```
+
+
+```{r}
+library(corrplot)
+
+numeric_cols <- df %>%
+  select(state_btl_cost, btl_price, bottle_qty, total, pack,
+         liter_size, margin_per_btl, margin_pct) %>%
+  na.omit()
+
+cor_matrix <- cor(numeric_cols)
+
+corrplot(
+  cor_matrix,
+  method      = "color",
+  type        = "upper",
+  addCoef.col = "black",
+  tl.col      = "black",
+  tl.srt      = 45,
+  number.cex  = 0.75,
+  col         = colorRampPalette(c("#0d3b66", "white", "#d00000"))(200),
+  title       = "Correlation Matrix \u2014 Numeric Variables",
+  mar         = c(0, 0, 2, 0)
+)
+
+cat("\n\U0001f4cb Key Correlations:\n")
+cat(sprintf("  btl_price \u2194 total        : %.2f\n", cor(df$btl_price, df$total)))
+cat(sprintf("  bottle_qty \u2194 total       : %.2f\n", cor(df$bottle_qty, df$total)))
+cat(sprintf("  liter_size \u2194 btl_price   : %.2f\n", cor(df$liter_size, df$btl_price)))
+cat(sprintf("  margin_pct \u2194 btl_price   : %.2f\n", cor(df$margin_pct, df$btl_price)))
+```
+
+
+```{r}
+library(stringr)
+
+vendor_perf <- df %>%
+  group_by(vendor) %>%
+  summarise(
+    revenue      = sum(total),
+    transactions = n(),
+    avg_margin   = mean(margin_pct),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(revenue)) %>%
+  slice_head(n = 10)
+
+p_vendor <- ggplot(vendor_perf,
+                   aes(x = transactions, y = revenue,
+                       size = avg_margin, label = str_wrap(vendor, 20))) +
+  geom_point(aes(colour = avg_margin), alpha = 0.85) +
+  geom_text(size = 2.8, vjust = -1.2, lineheight = 0.85) +
+  scale_colour_gradient(low = "#f9c74f", high = "#d00000", name = "Avg Margin %") +
+  scale_size_continuous(range = c(4, 14), guide = "none") +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  labs(
+    title    = "Top 10 Vendors \u2014 Revenue vs Transactions Bubble Chart",
+    subtitle = "Bubble size & colour = average gross margin %",
+    x        = "Number of Transactions",
+    y        = "Total Revenue (USD)"
+  ) +
+  theme_danmurphy
+
+print(p_vendor)
+```
+
+
+```{r}
+quarterly <- df %>%
+  group_by(year, quarter) %>%
+  summarise(revenue = sum(total), n = n(), .groups = "drop") %>%
+  mutate(yr_q = paste0(year, " ", quarter))
+
+p_quarterly <- ggplot(quarterly, aes(x = yr_q, y = revenue, fill = quarter)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = dollar(round(revenue / 1000), suffix = "K")),
+            vjust = -0.4, size = 3, fontface = "bold") +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K"),
+                     expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_brewer(palette = "Set1", name = "Quarter") +
+  labs(
+    title    = "Quarterly Revenue Breakdown",
+    subtitle = "Q4 consistently peaks — festive season drives premium purchases",
+    x        = NULL, y = "Total Revenue (USD)"
+  ) +
+  theme_danmurphy +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_quarterly)
+```
+
+
+```{r}
+cat("\n══════════════════════════════════════════════════════════\n")
+cat("  HYPOTHESIS TEST 1 — Independent Samples t-Test          \n")
+cat("══════════════════════════════════════════════════════════\n")
+cat("H₀ : μ_Premium = μ_Standard (mean total sale value)\n")
+cat("H₁ : μ_Premium > μ_Standard\n")
+cat("α  : 0.05\n\n")
+
+premium_vals  <- df %>% filter(is_premium == "Premium")  %>% pull(total)
+standard_vals <- df %>% filter(is_premium == "Standard") %>% pull(total)
+
+# Normality check (Shapiro on sample due to size)
+set.seed(42)
+sw_prem <- shapiro.test(sample(premium_vals,  min(5000, length(premium_vals))))
+sw_std  <- shapiro.test(sample(standard_vals, min(5000, length(standard_vals))))
+cat(sprintf("Shapiro-Wilk (Premium)  : W=%.4f, p=%.4f\n", sw_prem$statistic, sw_prem$p.value))
+cat(sprintf("Shapiro-Wilk (Standard) : W=%.4f, p=%.4f\n", sw_std$statistic,  sw_std$p.value))
+cat("→ Data not normally distributed; Welch's t-test is robust to this\n\n")
+
+# Welch's t-test (does not assume equal variance)
+t_result <- t.test(premium_vals, standard_vals, alternative = "greater", var.equal = FALSE)
+print(t_result)
+
+cat("\n📌 INTERPRETATION:\n")
+if (t_result$p.value < 0.05) {
+  cat(sprintf(
+    "  p-value = %.4f < 0.05 → REJECT H₀\n  ✅ Premium products generate significantly higher sales values\n",
+    t_result$p.value
+  ))
+} else {
+  cat(sprintf(
+    "  p-value = %.4f ≥ 0.05 → FAIL TO REJECT H₀\n  ❌ No significant difference detected\n",
+    t_result$p.value
+  ))
+}
+
+# Effect size (Cohen's d)
+pooled_sd <- sqrt((var(premium_vals) * (length(premium_vals) - 1) +
+                   var(standard_vals) * (length(standard_vals) - 1)) /
+                  (length(premium_vals) + length(standard_vals) - 2))
+cohens_d  <- (mean(premium_vals) - mean(standard_vals)) / pooled_sd
+cat(sprintf("  Cohen's d = %.3f (%s effect)\n", cohens_d,
+            ifelse(abs(cohens_d) >= 0.8, "Large",
+                   ifelse(abs(cohens_d) >= 0.5, "Medium", "Small"))))
+
+
+```
+
+
+```{r}
+library(car)
+
+cat("\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+cat("  HYPOTHESIS TEST 2 \u2014 One-Way ANOVA (Spirit Type)         \n")
+cat("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+cat("H\u2080 : \u03bc_Vodka = \u03bc_Whiskey = \u03bc_Rum = \u03bc_Tequila = ... (all equal)\n")
+cat("H\u2081 : At least one group mean differs\n")
+cat("\u03b1  : 0.05\n\n")
+
+# ANOVA assumption: Levene's test for homogeneity of variance
+levene_result <- leveneTest(total ~ spirit_type, data = df)
+print(levene_result)
+
+cat("\n\u2192 Running Welch ANOVA (robust to unequal variances):\n\n")
+
+# Welch's ANOVA (oneway.test)
+welch_anova <- oneway.test(total ~ spirit_type, data = df, var.equal = FALSE)
+print(welch_anova)
+
+cat("\n\U0001f4cc INTERPRETATION:\n")
+if (welch_anova$p.value < 0.05) {
+  cat(sprintf("  p-value = %.4f < 0.05 \u2192 REJECT H\u2080\n", welch_anova$p.value))
+  cat("  \u2705 Significant difference in mean sales exists across spirit types\n")
+} else {
+  cat(sprintf("  p-value = %.4f \u2265 0.05 \u2192 FAIL TO REJECT H\u2080\n", welch_anova$p.value))
+}
+
+# Standard ANOVA table for reference
+anova_model <- aov(total ~ spirit_type, data = df)
+cat("\n\U0001f4cb Classic ANOVA Table:\n")
+print(summary(anova_model))
+
+# Eta-squared (effect size)
+ss_between <- summary(anova_model)[[1]][["Sum Sq"]][1]
+ss_total   <- sum(summary(anova_model)[[1]][["Sum Sq"]])
+eta_sq     <- ss_between / ss_total
+cat(sprintf("\n  \u03b7\u00b2 (Eta-squared) = %.4f \u2192 %.1f%% of variance explained by spirit type\n",
+            eta_sq, eta_sq * 100))
+```
+
+
+```{r}
+cat("\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+cat("  POST-HOC \u2014 Tukey HSD (Pairwise Comparisons)             \n")
+cat("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+
+tukey_result <- TukeyHSD(anova_model)
+print(tukey_result)
+
+# Visualise Tukey
+par(mar = c(5, 18, 4, 2))
+plot(tukey_result, las = 1, col = "steelblue")
+par(mar = c(5, 4, 4, 2))  # reset margins
+
+cat("\n\U0001f4cc Pairs whose confidence interval does NOT cross zero are significantly different.\n")
+```
+
+
+```{r}
+cat("\n══════════════════════════════════════════════════════════\n")
+cat("  HYPOTHESIS TEST 3 — Two-Way ANOVA                       \n")
+cat("  Factors: Spirit Type × Premium Status                   \n")
+cat("══════════════════════════════════════════════════════════\n")
+
+two_way_anova <- aov(total ~ spirit_type * is_premium, data = df)
+cat("\n📋 Two-Way ANOVA Table:\n")
+print(summary(two_way_anova))
+
+# Interaction plot
+interaction.plot(
+  x.factor     = df$spirit_type,
+  trace.factor  = df$is_premium,
+  response      = df$total,
+  fun           = mean,
+  type          = "b",
+  col           = c("#0d3b66", "#d00000"),
+  lty           = 1,
+  lwd           = 2,
+  pch           = c(19, 17),
+  legend        = TRUE,
+  xlab          = "Spirit Type",
+  ylab          = "Mean Total Sale (USD)",
+  main          = "Interaction Plot: Spirit Type × Premium Status",
+  trace.label   = "Tier"
+)
+
+cat("\n📌 If the lines cross, a significant INTERACTION exists —\n")
+cat("   meaning the premium effect varies by spirit type.\n")
+
+```
+
+
+```{r}
+cat("\n══════════════════════════════════════════════════════════\n")
+cat("  HYPOTHESIS TEST 4 — Chi-Square Test of Independence     \n")
+cat("══════════════════════════════════════════════════════════\n")
+cat("H₀ : Spirit type is independent of bottle size category\n")
+cat("H₁ : There is a significant association between them\n\n")
+
+contingency_table <- table(df$spirit_type, df$size_category)
+print(contingency_table)
+
+chi_result <- chisq.test(contingency_table)
+print(chi_result)
+
+# Cramér's V (effect size)
+n      <- sum(contingency_table)
+k      <- min(nrow(contingency_table), ncol(contingency_table))
+cramers_v <- sqrt(chi_result$statistic / (n * (k - 1)))
+cat(sprintf("\n  Cramér's V = %.4f (effect size: %s)\n", cramers_v,
+            ifelse(cramers_v >= 0.3, "Large",
+                   ifelse(cramers_v >= 0.1, "Medium", "Small"))))
+
+cat("\n📌 INTERPRETATION:\n")
+if (chi_result$p.value < 0.05) {
+  cat(sprintf("  p-value = %.4e < 0.05 → REJECT H₀\n", chi_result$p.value))
+  cat("  ✅ Spirit type and bottle size category are NOT independent\n")
+}
+
+```
+
+
+```{r}
+library(dunn.test)
+
+cat("\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+cat("  HYPOTHESIS TEST 5 \u2014 Kruskal-Wallis + Dunn Post-Hoc      \n")
+cat("  DV: Margin %   |   Groups: Bottle Size Category         \n")
+cat("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+cat("H\u2080 : Median margin % is equal across all size categories\n")
+cat("H\u2081 : At least one size category has a different median margin %\n\n")
+
+kw_result <- kruskal.test(margin_pct ~ size_category, data = df)
+print(kw_result)
+
+cat("\n\U0001f4cc Dunn Post-Hoc Test (Bonferroni adjustment):\n")
+dunn.test(df$margin_pct, df$size_category, method = "bonferroni")
+```
+
+
+```{r}
+cat("\n══════════════════════════════════════════════════════════\n")
+cat("  HYPOTHESIS TEST 6 — Pearson Correlation Test            \n")
+cat("  btl_price ↔ bottle_qty                                  \n")
+cat("══════════════════════════════════════════════════════════\n")
+
+cor_test <- cor.test(df$btl_price, df$bottle_qty, method = "pearson")
+print(cor_test)
+
+cat("\n📌 INTERPRETATION:\n")
+cat(sprintf("  r = %.4f  |  p-value = %.4f\n", cor_test$estimate, cor_test$p.value))
+if (cor_test$p.value < 0.05) {
+  direction <- ifelse(cor_test$estimate > 0, "positive", "negative")
+  strength  <- ifelse(abs(cor_test$estimate) >= 0.5, "strong", "weak")
+  cat(sprintf("  ✅ Significant %s %s correlation\n", strength, direction))
+}
+
+# Scatter with smooth
+p_scatter <- ggplot(df %>% sample_n(min(1500, nrow(df))),
+                    aes(x = btl_price, y = bottle_qty)) +
+  geom_point(alpha = 0.35, colour = "#0d3b66", size = 1.5) +
+  geom_smooth(method = "lm", colour = "#d00000", linewidth = 1.2, se = TRUE) +
+  scale_x_continuous(labels = dollar_format(), limits = c(0, 60)) +
+  scale_y_continuous(limits = c(0, 50)) +
+  labs(
+    title    = "Bottle Price vs Quantity Sold",
+    subtitle = paste0("Pearson r = ", round(cor_test$estimate, 3),
+                      "  |  p = ", format.pval(cor_test$p.value, digits = 3)),
+    x        = "Bottle Price (USD)", y = "Quantity Sold"
+  ) +
+  theme_danmurphy
+
+print(p_scatter)
+
+```
+
+
+```{r}
+library(broom)
+
+cat("\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+cat("  REGRESSION \u2014 Multiple Linear Regression                  \n")
+cat("  DV: log(total)   |   IVs: btl_price, bottle_qty,        \n")
+cat("      liter_size, spirit_type, is_premium                 \n")
+cat("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+
+# Log-transform DV to handle right skew
+df_reg <- df %>%
+  mutate(log_total = log1p(total)) %>%
+  filter(is.finite(log_total))
+
+mlr_model <- lm(
+  log_total ~ btl_price + bottle_qty + liter_size + spirit_type + is_premium,
+  data = df_reg
+)
+
+cat("\n\U0001f4cb Regression Summary:\n")
+print(summary(mlr_model))
+
+# Tidy output
+cat("\n\U0001f4cb Tidy Coefficient Table:\n")
+tidy_coef <- tidy(mlr_model) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      p.value < 0.1   ~ ".",
+      TRUE            ~ ""
+    )
+  )
+knitr::kable(tidy_coef %>%
+               mutate(across(where(is.numeric), ~round(., 4))),
+             caption = "MLR Coefficient Table")
+
+# Model performance
+glance_result <- glance(mlr_model)
+cat(sprintf("\n  R\u00b2         = %.4f\n",  glance_result$r.squared))
+cat(sprintf("  Adj. R\u00b2    = %.4f\n",  glance_result$adj.r.squared))
+cat(sprintf("  F-stat     = %.2f  (p = %.2e)\n",
+            glance_result$statistic, glance_result$p.value))
+cat(sprintf("  AIC        = %.2f\n",  glance_result$AIC))
+```
+
+
+```{r}
+par(mfrow = c(2, 2))
+plot(mlr_model, which = 1:4, col = "#0d3b660D", pch = 16)
+par(mfrow = c(1, 1))
+
+cat("\n📌 DIAGNOSTIC GUIDE:\n")
+cat("  Plot 1 (Residuals vs Fitted) : Should show no pattern → linearity holds\n")
+cat("  Plot 2 (Q-Q Plot)            : Points on diagonal → normality of residuals\n")
+cat("  Plot 3 (Scale-Location)      : Flat line → homoscedasticity\n")
+cat("  Plot 4 (Cook's Distance)     : No points > 0.5 → no high-leverage outliers\n")
+
+```
+
+
+```{r}
+importance <- tidy_coef %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    abs_t    = abs(statistic),
+    direction = ifelse(estimate > 0, "Positive", "Negative"),
+    term      = str_replace_all(term, c("spirit_type" = "", "is_premium" = "Premium: "))
+  ) %>%
+  arrange(desc(abs_t))
+
+p_importance <- ggplot(importance, aes(x = reorder(term, abs_t),
+                                       y = abs_t, fill = direction)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = round(abs_t, 2)), hjust = -0.1, size = 3.5) +
+  scale_fill_manual(values = c("Positive" = "#0d3b66", "Negative" = "#d00000")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(
+    title    = "Variable Importance (|t-statistic|) in MLR Model",
+    subtitle = "Larger bar = stronger predictor of total sale value",
+    x        = NULL, y = "|t-statistic|", fill = "Direction"
+  ) +
+  theme_danmurphy
+
+print(p_importance)
+```
+
+
+```{r}
+library(gridExtra)
+
+p1 <- ggplot(spirit_summary, aes(x = reorder(spirit_type, total_revenue), y = total_revenue, fill = spirit_type)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  scale_fill_brewer(palette = "Set2") +
+  coord_flip() +
+  labs(title = "Revenue by Spirit", x = NULL, y = "Revenue (USD)") +
+  theme_danmurphy + theme(plot.title = element_text(size = 11))
+
+p2 <- ggplot(monthly_trend, aes(x = year_month, y = revenue)) +
+  geom_line(colour = "#0d3b66", linewidth = 1) +
+  geom_area(fill = "#a8d8ea", alpha = 0.4) +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  labs(title = "Monthly Revenue Trend", x = NULL, y = "Revenue (USD)") +
+  theme_danmurphy + theme(plot.title = element_text(size = 11),
+                          axis.text.x = element_text(angle = 45, hjust = 1))
+
+p3 <- ggplot(df, aes(x = spirit_type, y = margin_pct, fill = spirit_type)) +
+  geom_boxplot(show.legend = FALSE, outlier.size = 0.5) +
+  scale_fill_brewer(palette = "Pastel2") +
+  coord_flip() +
+  labs(title = "Margin % by Spirit", x = NULL, y = "Margin (%)") +
+  theme_danmurphy + theme(plot.title = element_text(size = 11))
+
+p4 <- ggplot(county_rev, aes(x = reorder(county, revenue), y = revenue)) +
+  geom_col(fill = "#0d3b66") +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  coord_flip() +
+  labs(title = "Top 10 Counties", x = NULL, y = "Revenue (USD)") +
+  theme_danmurphy + theme(plot.title = element_text(size = 11))
+
+grid.arrange(p1, p2, p3, p4, ncol = 2,
+             top = "Dan Murphy's Liquor Sales \u2014 Executive Analytics Dashboard")
+```
